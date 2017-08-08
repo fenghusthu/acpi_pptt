@@ -1,0 +1,475 @@
+From 91ea5ef2111b2f731e1503e21ecf91d4f53f1b82 Mon Sep 17 00:00:00 2001
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Date: Mon, 3 Jul 2017 15:57:23 +0800
+Subject: [PATCH 1/3] ACPI: PPTT: add parse driver for processor hierarchy
+ node structure
+
+Introduce a new struct processor_topology_node, which represents a single
+processor or a group of processors. This patch parses the processor
+hierarchy nodes in PPTT table into a processor_topology_node tree.
+Architecture specific code can use this tree to build its own cpu
+topology.
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+Signed-off-by: John Garry <john.garry@huawei.com>
+---
+ drivers/acpi/Kconfig      |   5 +
+ drivers/acpi/Makefile     |   1 +
+ drivers/acpi/bus.c        |   4 +
+ drivers/acpi/pptt.c       | 304 ++++++++++++++++++++++++++++++++++++++++++++++
+ include/linux/acpi_pptt.h |  82 +++++++++++++
+ 5 files changed, 396 insertions(+)
+ create mode 100644 drivers/acpi/pptt.c
+ create mode 100644 include/linux/acpi_pptt.h
+
+diff --git a/drivers/acpi/Kconfig b/drivers/acpi/Kconfig
+index 1ce52f8..01f080a 100644
+--- a/drivers/acpi/Kconfig
++++ b/drivers/acpi/Kconfig
+@@ -224,6 +224,11 @@ config ACPI_PROCESSOR_IDLE
+ 	bool
+ 	select CPU_IDLE
+ 
++config ACPI_PPTT
++	bool "Enable support for Processor Properties Topology Table (PPTT)"
++	default y
++	depends on ACPI_PROCESSOR
++
+ config ACPI_MCFG
+ 	bool
+ 
+diff --git a/drivers/acpi/Makefile b/drivers/acpi/Makefile
+index b1aacfc..b775ef6 100644
+--- a/drivers/acpi/Makefile
++++ b/drivers/acpi/Makefile
+@@ -70,6 +70,7 @@ obj-$(CONFIG_ACPI_VIDEO)	+= video.o
+ obj-$(CONFIG_ACPI_PCI_SLOT)	+= pci_slot.o
+ obj-$(CONFIG_ACPI_PROCESSOR)	+= processor.o
+ obj-$(CONFIG_ACPI)		+= container.o
++obj-$(CONFIG_ACPI_PPTT) 	+= pptt.o
+ obj-$(CONFIG_ACPI_THERMAL)	+= thermal.o
+ obj-$(CONFIG_ACPI_NFIT)		+= nfit/
+ obj-$(CONFIG_ACPI)		+= acpi_memhotplug.o
+diff --git a/drivers/acpi/bus.c b/drivers/acpi/bus.c
+index 5a6fbe0..f66638f 100644
+--- a/drivers/acpi/bus.c
++++ b/drivers/acpi/bus.c
+@@ -37,6 +37,7 @@
+ #include <asm/mpspec.h>
+ #endif
+ #include <linux/acpi_iort.h>
++#include <linux/acpi_pptt.h>
+ #include <linux/pci.h>
+ #include <acpi/apei.h>
+ #include <linux/dmi.h>
+@@ -1083,6 +1084,9 @@ void __init acpi_subsystem_init(void)
+ 		 */
+ 		regulator_has_full_constraints();
+ 	}
++
++	/* PPTT should be parsed before initializing the global array cpu_topology. */
++	acpi_pptt_init();
+ }
+ 
+ static acpi_status acpi_bus_table_handler(u32 event, void *table, void *context)
+diff --git a/drivers/acpi/pptt.c b/drivers/acpi/pptt.c
+new file mode 100644
+index 0000000..95c22b2
+--- /dev/null
++++ b/drivers/acpi/pptt.c
+@@ -0,0 +1,304 @@
++/*
++ * ACPI PPTT(Processor Propertier Topology Table) Support
++ *
++ * Copyright (c) 2017, Huawei Ltd.
++ * Author:	Xiongfeng Wang <wangxiongfeng2@huawei.com>
++ *		John Garry <john.garry@huawei.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License 2 as published
++ * by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * PPTT is used to describe the topological structure of processors and
++ * their shared resources, such as caches. This file parse the PPTT table
++ * into a tree structure, and architecture specific code can use this tree
++ * structure to build its own cpu topology.
++ */
++
++#define pr_fmt(fmt) "ACPI PPTT: " fmt
++
++#include <linux/acpi.h>
++#include <linux/acpi_pptt.h>
++#include <linux/kernel.h>
++
++
++/* Maintain all the processor_topology_node struct */
++__initdata LIST_HEAD(pr_node_list);
++/* indicate whether PPTT has been paresed successfully */
++static bool is_acpi_pptt_parsed_successfully __initdata;
++static struct acpi_table_header *pptt_header __initdata;
++
++/*
++ * Define a processor_topology_node to represent the whole system, just in case
++* PPTT doesn't provide one. This will make a standalone separate tree, which
++ * simplifies the code structure.
++ */
++static struct processor_topology_node pr_system_node __initdata = {
++	.acpi_processor_id = -1,
++	.package_id = -1,
++};
++
++static int __init
++parse_processor_node_structure(struct acpi_subtable_header *header,
++		const unsigned long end);
++
++void __init init_pr_system_node(void)
++{
++	INIT_LIST_HEAD(&pr_system_node.list);
++	list_add(&pr_system_node.list, &pr_node_list);
++}
++
++/*
++ * Search pr_node_list to get the processor_topology_node according to the
++ * offset address.
++ */
++static struct processor_topology_node * __init
++get_pr_node_by_offset(unsigned int pptt_offset)
++{
++	struct processor_topology_node *pr_node, *tmp_pr_node;
++
++	for_each_processor_topology_node(pr_node, tmp_pr_node) {
++		if (pr_node->pptt_offset == pptt_offset)
++			return pr_node;
++	}
++
++	return NULL;
++}
++
++#define MAX_CPU_TOPOLOGY_LEVEL 10
++/*
++ * In the process of calculate id for each node, we need a temporary variable
++ * to record current assigned max id for each level.
++ */
++static int max_level_id[MAX_CPU_TOPOLOGY_LEVEL] __initdata;
++static int max_depth __initdata;
++
++/*
++ * Calculate depth, package_id and cur_level_id for all the child node of the
++ * input parent.
++ */
++static void __init
++calc_topology_id_for_branch(struct processor_topology_node *parent)
++{
++	struct processor_topology_node *pr_node = parent->child;
++
++	while (pr_node) {
++		pr_node->depth = parent->depth + 1;
++		if (pr_node->depth < MAX_CPU_TOPOLOGY_LEVEL)
++			pr_node->cur_level_id = max_level_id[pr_node->depth]++;
++		else
++			pr_err(FW_BUG "cpu topology level exceed MAX_CPU_TOPOLOGY_LEVEL:%d\n",
++					MAX_CPU_TOPOLOGY_LEVEL);
++
++		if (pr_node->physical_package)
++			pr_node->package_id = pr_node->cur_level_id;
++		else
++			pr_node->package_id = parent->package_id;
++
++		if (pr_node->depth > max_depth)
++			max_depth = pr_node->depth;
++
++		calc_topology_id_for_branch(pr_node);
++		pr_node = pr_node->sibling;
++	}
++}
++
++/* Check whether all the non-child node is in the deepest level */
++static int __init check_topology_error(void)
++{
++	struct processor_topology_node *pr_node, *tmp_pr_node;
++
++	for_each_processor_topology_node(pr_node, tmp_pr_node) {
++		if (pr_node->child == NULL && pr_node->depth != max_depth)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
++/*
++ * Calculate depth, package_id and cur_level_id for each node in the
++ * processor_topology_node tree and check whether all the leaf node is in the
++ * deepest level.
++ */
++static int __init calculate_processor_topology_id(void)
++{
++	calc_topology_id_for_branch(&pr_system_node);
++
++	if (check_topology_error()) {
++		pr_err(FW_BUG "Topology error detected in PPTT table!\n");
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++/* return the last sibling node of the input pr_node */
++static inline struct processor_topology_node * __init
++get_last_sibling_node(struct processor_topology_node *pr_node)
++{
++	struct processor_topology_node *tmp_pr_node = pr_node;
++
++	while (tmp_pr_node->sibling)
++		tmp_pr_node = tmp_pr_node->sibling;
++	return tmp_pr_node;
++}
++
++static inline void __init
++link_pr_node_to_parent(struct processor_topology_node *child,
++		struct processor_topology_node *parent)
++{
++	if (!parent->child)
++		parent->child = child;
++	else
++		get_last_sibling_node(parent->child)->sibling = child;
++
++	child->parent = parent;
++}
++
++/*
++ * Add the processor_topology_node into the tree structure according to the
++ * offset of its parent acpi_pptt_processor.
++ */
++static int __init insert_pr_node(struct processor_topology_node *pr_node,
++		int parent_offset)
++{
++	struct processor_topology_node *parent_pr_node;
++	struct acpi_pptt_processor *tmp_pptt_pr;
++
++	/*
++	 * If a processor hierarchy node has no parent, add it to the child
++	 * of pr_system_node. If there exist several non-parent processor
++	 * hierarchy node, this guarantee a standalone tree.
++	 */
++	if (!parent_offset) {
++		link_pr_node_to_parent(pr_node, &pr_system_node);
++		return 0;
++	}
++
++	/*
++	 * If the parent node has not been parsed, then parse it and build the
++	 * ralationship between the parent and the child node.
++	 */
++	parent_pr_node = get_pr_node_by_offset(parent_offset);
++
++	if (!parent_pr_node) {
++		tmp_pptt_pr = ACPI_ADD_PTR(struct acpi_pptt_processor,
++				pptt_header, parent_offset);
++		if (tmp_pptt_pr->header.type != ACPI_PPTT_TYPE_PROCESSOR) {
++			pr_err(FW_BUG "Invalid parent field of processor "
++					"hierarchy node structure\n");
++			return -EINVAL;
++		}
++
++		if (parse_processor_node_structure(&tmp_pptt_pr->header,
++			(unsigned long)tmp_pptt_pr + tmp_pptt_pr->header.length))
++			return -EINVAL;
++		parent_pr_node = get_pr_node_by_offset(parent_offset);
++	}
++
++	link_pr_node_to_parent(pr_node, parent_pr_node);
++
++	return 0;
++}
++
++/*
++ * Parse a processor hierarchy node structure into a
++ * processor_topology_node structure, get the parent processor_topology_node
++ * according to the 'Parent' field, and build the relationship between the
++ * parent and the child processor_topology_node. If the parent processor
++ * hierarchy node structure has not been parsed, then parse it recursively.
++ */
++static int __init
++parse_processor_node_structure(struct acpi_subtable_header *header,
++		const unsigned long end)
++{
++	struct acpi_pptt_processor *pptt_pr;
++	struct processor_topology_node *pr_node = NULL;
++	unsigned int offset;
++
++	pptt_pr = (struct acpi_pptt_processor *)header;
++
++	/*
++	 * If we can find the corresponding processor_topology_node according to
++	 * the offset address of the processor hierarchy node structure, then
++	 * the processor hierarchy node has been parsed, and we just return.
++	 * This happens when this function is called recursively.
++	 */
++	offset = ACPI_PTR_DIFF(pptt_pr, pptt_header);
++	if (get_pr_node_by_offset(offset))
++		return 0;
++
++	pr_node = kzalloc(sizeof(*pr_node), GFP_KERNEL);
++	if (!pr_node)
++		return -ENOMEM;
++
++	pr_node->pptt_offset = offset;
++	list_add(&pr_node->list, &pr_node_list);
++
++
++	pr_node->physical_package = pptt_pr->flags & ACPI_PPTT_PHYSICAL_PACKAGE;
++
++	if (pptt_pr->flags & ACPI_PPTT_ACPI_PROCESSOR_ID_VALID)
++		pr_node->acpi_processor_id = pptt_pr->acpi_processor_id;
++	else
++		pr_node->acpi_processor_id = -1;
++
++	pr_debug("Processor Hierarchy Node: offset=0x%04x flags=0x%x "
++			"parent=0x%04x ACPI Processor ID=%2d\n",
++			offset, pptt_pr->flags, pptt_pr->parent,
++			pptt_pr->acpi_processor_id);
++
++	/* insert pr_node into tree structure according to parent offset*/
++	if (insert_pr_node(pr_node, pptt_pr->parent))
++		goto out_error;
++
++	return 0;
++
++out_error:
++	kfree(pr_node);
++	return -EINVAL;
++}
++
++bool __init acpi_pptt_parsed_successfully(void)
++{
++	return is_acpi_pptt_parsed_successfully;
++}
++
++void __init acpi_pptt_init(void)
++{
++	acpi_status status = acpi_get_table(ACPI_SIG_PPTT, 0, &pptt_header);
++	if (ACPI_FAILURE(status)) {
++		if (status != AE_NOT_FOUND) {
++			const char *msg = acpi_format_exception(status);
++			pr_err("Failed to get table, %s\n", msg);
++		}
++		return;
++	}
++
++	init_pr_system_node();
++
++	/*
++	 * Parse each processor hierarchy node structure in PPTT table,
++	 * and construct a processor_topology_node tree according to parent
++	 * field in processor hierarchy node structure.
++	 */
++	if (acpi_table_parse_entries(ACPI_SIG_PPTT,
++			sizeof(struct acpi_table_pptt), ACPI_PPTT_TYPE_PROCESSOR,
++			parse_processor_node_structure, 0) < 0)
++		return;
++
++	/*
++	 * Calculate the level, package_id and cur_level_id for each node in the
++	 * processor_topology_node tree.
++	 */
++	if (!calculate_processor_topology_id()) {
++		is_acpi_pptt_parsed_successfully = true;
++		pr_info("ACPI: PPTT table successfully parsed\n");
++	}
++}
+diff --git a/include/linux/acpi_pptt.h b/include/linux/acpi_pptt.h
+new file mode 100644
+index 0000000..1bf8231
+--- /dev/null
++++ b/include/linux/acpi_pptt.h
+@@ -0,0 +1,82 @@
++/*
++ * ACPI PPTT(Processor Propertier Topology Table) Support
++ *
++ * Copyright (c) 2017, Huawei Ltd.
++ * Author:	Xiongfeng Wang <wangxiongfeng2@huawei.com>
++ *		John Garry <john.garry@huawei.com>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License 2 as published
++ * by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ */
++
++#ifndef __ACPI_PPTT_H__
++#define __ACPI_PPTT_H__
++
++
++/*
++ * struct processor_topology_node - represent a single processor or a group
++ * @list		used to add this structure into a global list_head.
++ * @pptt_offset:	the distance between the start address of a processor
++ *			hierarchy node struct and the start address of the
++ *			PPTT table.
++ *
++ * @physical_package:	whether this node represents the boundary of a physical
++ *			package
++ * @acpi_processor_id:	match the ACPI processor ID field of the associated
++ *			processor's entry in the MADT or the _UID of the
++ *			associated processor container.
++ *
++ * @package_id:		the id of the package this node belong to.
++ * @cur_level_id:	the ID of the node in current level, count start from 0,
++ *			architecture specific code can use this member to get the
++ *			thread_id, core_id or cluster_id.
++ * @depth:		the depth of the node in processor topology tree.
++ *
++ * @parent:		parent processor topology node
++ * @child:		child processor topology node
++ * @sibling:		sibling processor topology node
++ */
++struct processor_topology_node {
++	struct list_head list;
++	unsigned int pptt_offset;
++
++	bool physical_package;
++	int acpi_processor_id;
++
++	unsigned int package_id;
++	unsigned int cur_level_id;
++	unsigned int depth;
++
++	struct processor_topology_node *parent, *child, *sibling;
++};
++
++#ifdef CONFIG_ACPI_PPTT
++
++extern struct list_head pr_node_list __initdata;
++
++/* tmp_pr_node is a temporary storage used in list_for_each_entry_safe */
++#define for_each_processor_topology_node(pr_node, tmp_pr_node)	\
++	list_for_each_entry_safe(pr_node, tmp_pr_node, &pr_node_list, list)
++
++void acpi_pptt_init(void) __init;
++
++bool acpi_pptt_parsed_successfully(void) __init;
++
++#else
++
++static inline void __init acpi_pptt_init(void) { }
++
++static inline bool __init acpi_pptt_parsed_successfully(void)
++{
++	return false;
++}
++
++#endif
++
++#endif /* __ACPI_PPTT_H__ */
+-- 
+1.7.12.4
+
