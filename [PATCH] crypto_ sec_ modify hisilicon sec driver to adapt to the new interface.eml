@@ -1,0 +1,98 @@
+Received: from huawei.com (unknown [45.249.212.32])
+	by newusamx2.qq.com (NewMx) with SMTP id 
+	for <1053585451@qq.com>; Fri, 14 Sep 2018 15:28:20 +0800
+X-QQ-FEAT: 5gms5Di3ODj9u5IgnQKkXj3mO6nBaElnCDW9e5DBh1+MttwFYTlsdcuPfORgR
+	jHz2QQ07DhskbafIo4GVmxqu3aCe51lOQ2ejEZDy9CumTEcc4tPkohlsSq9irqF4RTLIf6r
+	cZLVeiK7HhFIDBPfoOgR1J/lafpAusu/Fs9ZC+iJyq2qM/KFz5MPUSrWboieUWFfQeCBDh4
+	bIsZsppGSnSCVXeBLgpQFJUBNi3KJx+plmQ+k3tR/6hgwSUObuPIcJX//nOcxGUssZQx/Ds
+	CCIqGii2rnMcMc70zEwrM4rSDFYDoICsoley8hrn0FFjwI
+X-QQ-MAILINFO: MfiUJyQXz1c08d6v0AznGC9hlGW4No13mMYz0zfAJ1OL+aCsc9zhqaOVv
+	1qEg2NMXWW4CZ+WES/UoikEN2uqBNOKg/+g9DRNH7J4WMQKjK2vP2Iyu3Ue6x/R/Hb3xMOj
+	HNsvqpP/jf/1
+X-QQ-mid: usamxproxy11t1536910102tuewle9
+X-QQ-ORGSender: wangxiongfeng2@huawei.com
+X-KK-mid:usamxproxy11t1536910102tuewle9
+Received: from DGGEMS407-HUB.china.huawei.com (unknown [172.30.72.60])
+	by Forcepoint Email with ESMTP id 25F006572D902
+	for <1053585451@qq.com>; Fri, 14 Sep 2018 15:28:18 +0800 (CST)
+Received: from linux-ibm.site (10.175.102.37) by
+ DGGEMS407-HUB.china.huawei.com (10.3.19.207) with Microsoft SMTP Server id
+ 14.3.399.0; Fri, 14 Sep 2018 15:28:08 +0800
+From: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+To: <1053585451@qq.com>, <wangxiongfeng2@huawei.com>
+CC: <huawei.libin@huawei.com>, <guohanjun@huawei.com>
+Subject: [PATCH] crypto: sec: modify hisilicon sec driver to adapt to the new interface
+Date: Fri, 14 Sep 2018 15:15:47 +0800
+Message-ID: <1536909347-62107-1-git-send-email-wangxiongfeng2@huawei.com>
+X-Mailer: git-send-email 1.7.12.4
+MIME-Version: 1.0
+Content-Type: text/plain
+X-Originating-IP: [10.175.102.37]
+X-CFilter-Loop: Reflected
+
+This patch modify hisilicon sec driver to adapt to the new interface.
+
+Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
+---
+ crypto/geniv.c                          |  2 +-
+ drivers/crypto/hisilicon/sec/sec_algs.c | 11 ++++++++---
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/crypto/geniv.c b/crypto/geniv.c
+index 55d1212..0ebe8b3 100644
+--- a/crypto/geniv.c
++++ b/crypto/geniv.c
+@@ -2224,7 +2224,7 @@ static int geniv_template_create(struct crypto_template *tmpl,
+ 
+ static int __init geniv_init(void)
+ {
+-	return crypto_register_template_array(geniv_tmpl, IV_TYPE_NUM);
++	//return crypto_register_template_array(geniv_tmpl, IV_TYPE_NUM);
+ }
+ 
+ static void __exit geniv_exit(void)
+diff --git a/drivers/crypto/hisilicon/sec/sec_algs.c b/drivers/crypto/hisilicon/sec/sec_algs.c
+index f7d6d69..c02009c1 100644
+--- a/drivers/crypto/hisilicon/sec/sec_algs.c
++++ b/drivers/crypto/hisilicon/sec/sec_algs.c
+@@ -12,6 +12,7 @@
+ #include <crypto/des.h>
+ #include <crypto/skcipher.h>
+ #include <crypto/xts.h>
++#include <crypto/geniv.h>
+ #include <crypto/internal/skcipher.h>
+ 
+ #include "sec_drv.h"
+@@ -258,6 +259,10 @@ static int sec_alg_skcipher_setkey_aes_ecb(struct crypto_skcipher *tfm,
+ 					   const u8 *key, unsigned int keylen)
+ {
+ 	enum sec_cipher_alg alg;
++	struct geniv_key_info *info = (struct geniv_key_info *)key;
++
++	keylen = info->key_size;
++	key = info->key;
+ 
+ 	switch (keylen) {
+ 	case AES_KEYSIZE_128:
+@@ -939,7 +944,7 @@ static void sec_alg_skcipher_exit_with_queue(struct crypto_skcipher *tfm)
+ static struct skcipher_alg sec_algs[] = {
+ 	{
+ 		.base = {
+-			.cra_name = "ecb(aes)",
++			.cra_name = "null(ecb(aes))",
+ 			.cra_driver_name = "hisi_sec_aes_ecb",
+ 			.cra_priority = 4001,
+ 			.cra_flags = CRYPTO_ALG_ASYNC,
+@@ -953,8 +958,8 @@ static void sec_alg_skcipher_exit_with_queue(struct crypto_skcipher *tfm)
+ 		.setkey = sec_alg_skcipher_setkey_aes_ecb,
+ 		.decrypt = sec_alg_skcipher_decrypt,
+ 		.encrypt = sec_alg_skcipher_encrypt,
+-		.min_keysize = AES_MIN_KEY_SIZE,
+-		.max_keysize = AES_MAX_KEY_SIZE,
++		.min_keysize = sizeof(struct geniv_key_info),
++		.max_keysize = sizeof(struct geniv_key_info),
+ 		.ivsize = 0,
+ 	}, {
+ 		.base = {
+-- 
+1.7.12.4
