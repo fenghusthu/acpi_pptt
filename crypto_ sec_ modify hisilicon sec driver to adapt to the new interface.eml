@@ -34,23 +34,9 @@ This patch modify hisilicon sec driver to adapt to the new interface.
 
 Signed-off-by: Xiongfeng Wang <wangxiongfeng2@huawei.com>
 ---
- crypto/geniv.c                          |  2 +-
  drivers/crypto/hisilicon/sec/sec_algs.c | 11 ++++++++---
  2 files changed, 9 insertions(+), 4 deletions(-)
 
-diff --git a/crypto/geniv.c b/crypto/geniv.c
-index 55d1212..0ebe8b3 100644
---- a/crypto/geniv.c
-+++ b/crypto/geniv.c
-@@ -2224,7 +2224,7 @@ static int geniv_template_create(struct crypto_template *tmpl,
- 
- static int __init geniv_init(void)
- {
--	return crypto_register_template_array(geniv_tmpl, IV_TYPE_NUM);
-+	//return crypto_register_template_array(geniv_tmpl, IV_TYPE_NUM);
- }
- 
- static void __exit geniv_exit(void)
 diff --git a/drivers/crypto/hisilicon/sec/sec_algs.c b/drivers/crypto/hisilicon/sec/sec_algs.c
 index f7d6d69..c02009c1 100644
 --- a/drivers/crypto/hisilicon/sec/sec_algs.c
